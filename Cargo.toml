@@ -1,0 +1,16 @@
+[package]
+name = "ast-parser"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+syn = { version = "2", features = [
+    "full",
+    "extra-traits",
+    "visit",
+    "proc-macro",
+] }
+proc-macro2 = "1"
+prettyplease = "0.2"
+itertools = "0.14"
+multimap = "0.10"
