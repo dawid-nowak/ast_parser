@@ -4,11 +4,8 @@ use std::fs;
 use std::process;
 
 use itertools::Itertools;
-use itertools::PeekingNext;
 use multimap::MultiMap;
 use proc_macro2::{Ident, Span};
-use syn::AttrStyle;
-use syn::Fields;
 use syn::File;
 use syn::Item;
 use syn::ItemStruct;
@@ -52,7 +49,7 @@ fn check_simple_type(path: &PathSegment, is_simple: &mut bool) {
 impl<'ast> Visit<'ast> for StructVisitor<'ast> {
     fn visit_item_struct(&mut self, node: &'ast ItemStruct) {
         println!("Visiting Struct name == {}", node.ident);
-        println!("Visiting Struct name == {:#?}", node);
+        //println!("Visiting Struct name == {:#?}", node);
         let mut is_simple_leaf = true;
         node.fields.iter().for_each(|f| match &f.ty {
             Type::Path(path_type) => {
@@ -114,7 +111,6 @@ fn break_into_words(type_name: &str) -> Vec<String> {
 }
 
 pub fn common_words(words_sets: &[Vec<String>]) -> Vec<String> {
-    println!("Words {words_sets:?}");
     let word_sets: Vec<BTreeSet<String>> = words_sets
         .iter()
         .cloned()
@@ -128,7 +124,6 @@ pub fn common_words(words_sets: &[Vec<String>]) -> Vec<String> {
     };
 
     for word_set in word_sets {
-        println!("Words {intersection:?}");
         intersection = intersection.intersection(&word_set).cloned().collect();
     }
     Vec::from_iter(intersection)
@@ -172,18 +167,15 @@ fn main() {
 
     let items: Vec<_> = potentially_similar_items
         .iter_all()
-        .filter_map(|(k, v)| {
-            println!(
-                "Similar items {:?}",
-                v.iter().map(|v| v.0.to_string()).collect::<Vec<_>>()
-            );
+        .filter_map(|(_k, v)| {
+            let mapped_type_names = v.iter().map(|v| v.0.to_string()).collect::<Vec<_>>();
+
             let words: Vec<Vec<String>> = v
                 .iter()
                 .map(|v| break_into_words(&v.0.to_string()))
                 .collect();
 
             let common_words = common_words(&words);
-            println!("Longest prefix {common_words:?}");
 
             if let Some((_i, s)) = v.first() {
                 let mut new_struct = (**s).clone();
@@ -211,7 +203,9 @@ fn main() {
                     &format!("Shared{}", common_words.iter().cloned().collect::<String>()),
                     Span::call_site(),
                 );
-                Some(Item::Struct(new_struct))
+                let mapped = (mapped_type_names.clone(), new_struct.ident.to_string());
+                println!("Mapped types = {:#?}", &mapped);
+                Some((mapped_type_names, Item::Struct(new_struct)))
             } else {
                 None
             }
@@ -221,7 +215,7 @@ fn main() {
     let out = prettyplease::unparse(&File {
         shebang: None,
         attrs: vec![],
-        items,
+        items: items.into_iter().map(|(_names, items)| items).collect(),
     });
 
     println!("\n\n\n Out code {out}");
