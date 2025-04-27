@@ -1,10 +1,14 @@
+use std::collections::BTreeSet;
 use std::env;
 use std::fs;
 use std::process;
 
 use itertools::Itertools;
+use itertools::PeekingNext;
 use multimap::MultiMap;
 use proc_macro2::{Ident, Span};
+use syn::AttrStyle;
+use syn::Fields;
 use syn::File;
 use syn::Item;
 use syn::ItemStruct;
@@ -48,6 +52,7 @@ fn check_simple_type(path: &PathSegment, is_simple: &mut bool) {
 impl<'ast> Visit<'ast> for StructVisitor<'ast> {
     fn visit_item_struct(&mut self, node: &'ast ItemStruct) {
         println!("Visiting Struct name == {}", node.ident);
+        println!("Visiting Struct name == {:#?}", node);
         let mut is_simple_leaf = true;
         node.fields.iter().for_each(|f| match &f.ty {
             Type::Path(path_type) => {
@@ -73,22 +78,60 @@ impl<'ast> Visit<'ast> for StructVisitor<'ast> {
     }
 }
 
-pub fn longest_common_prefix(strs: &[String]) -> String {
-    if strs.is_empty() {
-        return String::new();
-    }
+fn break_into_words(type_name: &str) -> Vec<String> {
+    let mut words = vec![];
+    let mut current_word = String::new();
 
-    let mut prefix = strs[0].clone();
-
-    while !prefix.is_empty() {
-        if strs.iter().any(|s| !s.starts_with(&prefix)) {
-            prefix.pop(); // Shorten the prefix
+    for t in type_name.chars().tuple_windows() {
+        let (current, next, next_next) = t;
+        if current.is_uppercase() {
+            if next.is_uppercase() {
+                current_word.push(current);
+                if !next_next.is_uppercase() {
+                    words.push(current_word);
+                    current_word = String::new();
+                }
+            } else {
+                current_word.push(current);
+            }
         } else {
-            return prefix;
+            current_word.push(current);
+            if next.is_uppercase() {
+                words.push(current_word);
+                current_word = String::new();
+            }
         }
     }
+    let len = type_name.len() - 2;
+    if len > 0 {
+        current_word += &type_name[len..];
+        words.push(current_word);
+    } else {
+        words.push(type_name.to_owned());
+    }
 
-    prefix
+    words
+}
+
+pub fn common_words(words_sets: &[Vec<String>]) -> Vec<String> {
+    println!("Words {words_sets:?}");
+    let word_sets: Vec<BTreeSet<String>> = words_sets
+        .iter()
+        .cloned()
+        .map(BTreeSet::from_iter)
+        .collect();
+
+    let mut intersection = if let Some(first) = word_sets.first() {
+        first.clone()
+    } else {
+        return vec![];
+    };
+
+    for word_set in word_sets {
+        println!("Words {intersection:?}");
+        intersection = intersection.intersection(&word_set).cloned().collect();
+    }
+    Vec::from_iter(intersection)
 }
 
 fn main() {
@@ -127,28 +170,45 @@ fn main() {
         potentially_similar_items.insert(&i.fields, (&i.ident, i));
     }
 
-    let _items: Vec<_> = potentially_similar_items
+    let items: Vec<_> = potentially_similar_items
         .iter_all()
         .filter_map(|(k, v)| {
             println!(
                 "Similar items {:?}",
                 v.iter().map(|v| v.0.to_string()).collect::<Vec<_>>()
             );
-            let reversed_names: Vec<_> = v
+            let words: Vec<Vec<String>> = v
                 .iter()
-                .map(|v| v.0.to_string().chars().rev().collect())
-                .sorted_by(|r: &String, l: &String| Ord::cmp(&l.len(), &r.len()))
+                .map(|v| break_into_words(&v.0.to_string()))
                 .collect();
-            let longest_prefix = longest_common_prefix(&reversed_names)
-                .chars()
-                .rev()
-                .collect::<String>();
-            println!("Longest prefix {longest_prefix}");
+
+            let common_words = common_words(&words);
+            println!("Longest prefix {common_words:?}");
 
             if let Some((_i, s)) = v.first() {
                 let mut new_struct = (**s).clone();
+                new_struct.attrs = s
+                    .attrs
+                    .iter()
+                    .filter(|&a| {
+                        a.meta.path().get_ident() != Some(&Ident::new("doc", Span::call_site()))
+                    })
+                    .cloned()
+                    .collect();
+                new_struct.fields = s.fields.clone();
+                new_struct.fields.iter_mut().for_each(|f| {
+                    f.attrs = f
+                        .attrs
+                        .clone()
+                        .into_iter()
+                        .filter(|a| {
+                            a.meta.path().get_ident() != Some(&Ident::new("doc", Span::call_site()))
+                        })
+                        .collect::<Vec<_>>()
+                });
+
                 new_struct.ident = Ident::new(
-                    &format!("Shared{}", longest_prefix.chars().rev().collect::<String>()),
+                    &format!("Shared{}", common_words.iter().cloned().collect::<String>()),
                     Span::call_site(),
                 );
                 Some(Item::Struct(new_struct))
@@ -158,14 +218,41 @@ fn main() {
         })
         .collect();
 
-    // let out = prettyplease::unparse(&File {
-    //     shebang: None,
-    //     attrs: vec![],
-    //     items,
-    // });
+    let out = prettyplease::unparse(&File {
+        shebang: None,
+        attrs: vec![],
+        items,
+    });
 
-    // println!("\n\n\n Out code {out}");
+    println!("\n\n\n Out code {out}");
 
     // Debug impl is available if Syn is built with "extra-traits" feature.
     //println!("{:#?}", syntax);
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::break_into_words;
+
+    #[test]
+    fn test_word_breaking() {
+        let expected_words = [
+            "GRPC", "Route", "Rules", "Backend", "Refs", "Filters", "Request", "Mirror", "Backend",
+            "Ref",
+        ];
+        let words = break_into_words("GRPCRouteRulesBackendRefsFiltersRequestMirrorBackendRef");
+        assert_eq!(expected_words.to_vec(), words);
+
+        let expected_words = [
+            "GRPC", "Route", "Rules", "Backend", "Refs", "Filters", "Request", "HTTPS", "Mirror",
+            "Backend", "Ref",
+        ];
+        let words =
+            break_into_words("GRPCRouteRulesBackendRefsFiltersRequestHTTPSMirrorBackendRef");
+        assert_eq!(expected_words.to_vec(), words);
+
+        let expected_words = ["f", "RP"];
+        let words = break_into_words("fRP");
+        assert_eq!(expected_words.to_vec(), words);
+    }
 }
