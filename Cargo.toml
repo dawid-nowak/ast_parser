@@ -8,6 +8,7 @@ syn = { version = "2", features = [
     "full",
     "extra-traits",
     "visit",
+    "visit-mut",
     "proc-macro",
 ] }
 proc-macro2 = "1"
