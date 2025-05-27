@@ -1,11 +1,14 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
-use std::env;
+
 use std::fs;
 use std::io::Write;
-use std::process;
 
+use clap::Parser;
+use clap::command;
 use itertools::Itertools;
+use log::debug;
+use log::info;
 use multimap::MultiMap;
 use proc_macro2::{Ident, Span};
 use syn::File;
@@ -30,6 +33,7 @@ use self::prelude::*;";
 const SHARED_TYPES_USE_PREAMBLE: &str = "use crate::shared_types::*;\n\n";
 
 struct StructVisitor<'ast> {
+    name: String,
     structs: Vec<&'ast ItemStruct>,
 }
 
@@ -91,12 +95,12 @@ fn check_simple_type(path: &PathSegment, is_simple: &mut bool) {
 
 impl<'ast> Visit<'ast> for StructVisitor<'ast> {
     fn visit_item_struct(&mut self, node: &'ast ItemStruct) {
-        println!("Visiting Struct name == {}", node.ident);
-        //println!("Visiting Struct name == {:#?}", node);
+        debug!("Visiting Struct name == {}", node.ident);
+        //debug!("Visiting Struct name == {:#?}", node);
         let mut is_simple_leaf = true;
         node.fields.iter().for_each(|f| match &f.ty {
             Type::Path(path_type) => {
-                println!(
+                debug!(
                     "\twith field name = {:?} \n\t\tfield type = {:?}",
                     f.ident, f.ty
                 );
@@ -110,7 +114,7 @@ impl<'ast> Visit<'ast> for StructVisitor<'ast> {
                 is_simple_leaf = false;
             }
         });
-        println!("Visiting Struct name == {} {is_simple_leaf}", node.ident);
+        debug!("Visiting Struct name == {} {is_simple_leaf}", node.ident);
         if is_simple_leaf {
             self.structs.push(node);
         }
@@ -120,12 +124,12 @@ impl<'ast> Visit<'ast> for StructVisitor<'ast> {
 
 impl VisitMut for StructRenamer {
     fn visit_item_struct_mut(&mut self, node: &mut ItemStruct) {
-        println!("Renaming Struct name == {}", node.ident);
+        debug!("Renaming Struct name == {}", node.ident);
 
         node.fields.iter_mut().for_each(|f| {
             let ty = f.ty.clone();
             if let Type::Path(path_type) = &mut f.ty {
-                println!(
+                debug!(
                     "\twith field name = {:?} \n\t\tfield type = {:?}",
                     f.ident, ty
                 );
@@ -194,48 +198,68 @@ pub fn common_words(words_sets: &[Vec<String>]) -> Vec<String> {
     Vec::from_iter(intersection)
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut args = env::args();
-    let _ = args.next(); // executable name
+#[derive(Parser, Debug)]
+#[command(version, about, long_about = None)]
+struct Args {
+    #[arg(long)]
+    apis_dir: String,
 
-    let (http_routes_file_path, grpc_routes_file_path, output_dir) =
-        match (args.next(), args.next(), args.next(), args.next()) {
-            (Some(http_routes_file_path), Some(grpc_routes_file_path), Some(output_dir), None) => {
-                (http_routes_file_path, grpc_routes_file_path, output_dir)
-            }
-            _ => {
-                eprintln!("Usage: dump-syntax path/to/filename.rs");
-                process::exit(1);
-            }
+    #[arg(long)]
+    out_dir: String,
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    simple_logger::init_with_env().unwrap();
+    let Args { apis_dir, out_dir } = Args::parse();
+
+    let Ok(_) = fs::exists(out_dir.clone()) else {
+        return Err("our dir doesn't exist".into());
+    };
+
+    let mut visitors = vec![];
+
+    for dir_entry in fs::read_dir(apis_dir).unwrap() {
+        let Ok(dir_entry) = dir_entry else {
+            continue;
         };
 
-    let http_routes_path = std::path::Path::new(&http_routes_file_path);
-    let grpc_routes_path = std::path::Path::new(&grpc_routes_file_path);
-
-    let http_routes_src = fs::read_to_string(http_routes_path).expect("unable to read file");
-    let grpc_routes_src = fs::read_to_string(grpc_routes_path).expect("unable to read file");
-
-    let mut http_routes_syntaxt = syn::parse_file(&http_routes_src).expect("unable to parse file");
-    let mut grpc_routes_syntaxt = syn::parse_file(&grpc_routes_src).expect("unable to parse file");
-    let mut http_visitor = StructVisitor {
-        structs: Vec::new(),
-    };
-
-    let mut grpc_visitor = StructVisitor {
-        structs: Vec::new(),
-    };
-
-    http_visitor.visit_file(&http_routes_syntaxt);
-    grpc_visitor.visit_file(&grpc_routes_syntaxt);
+        if let Ok(name) = dir_entry.file_name().into_string() {
+            if name.ends_with(".rs") {
+                info!("Adding file {:?}", dir_entry.path());
+                if let Ok(api_file) = fs::read_to_string(dir_entry.path()) {
+                    if let Ok(syntaxt_file) = syn::parse_file(&api_file) {
+                        let visitor = StructVisitor {
+                            name,
+                            structs: Vec::new(),
+                        };
+                        visitors.push((visitor, syntaxt_file));
+                    }
+                }
+            }
+        }
+    }
 
     let mut potentially_similar_items = MultiMap::new();
-    for i in http_visitor.structs.iter().chain(&grpc_visitor.structs) {
-        potentially_similar_items.insert(&i.fields, (&i.ident, i));
-    }
+
+    let visitors: Vec<_> = visitors
+        .into_iter()
+        .map(|(mut visitor, file)| {
+            visitor.visit_file(&file);
+            visitor.structs.into_iter().for_each(|i| {
+                potentially_similar_items.insert(i.fields.clone(), (i.ident.clone(), (*i).clone()));
+            });
+            (visitor.name, file)
+        })
+        .collect();
 
     let items: Vec<_> = potentially_similar_items
         .iter_all()
+        .filter(|(_k, v)| v.len() > 1)
         .filter_map(|(_k, v)| {
+            info!(
+                "Potentially similar structs {:#?}",
+                v.iter().map(|(i, _)| i.to_string()).collect::<Vec<_>>()
+            );
             let mapped_type_names = v.iter().map(|v| v.0.to_string()).collect::<Vec<_>>();
 
             let words: Vec<Vec<String>> = v
@@ -246,7 +270,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let common_words = common_words(&words);
 
             if let Some((_i, s)) = v.first() {
-                let mut new_struct = (**s).clone();
+                let mut new_struct = s.clone();
                 new_struct.attrs = s
                     .attrs
                     .iter()
@@ -276,7 +300,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     mapped.insert(mapped_type_name, new_struct.ident.to_string().to_owned());
                 }
 
-                println!("Mapped types = {:#?}", &mapped);
+                info!("Mapped types = {:#?}", &mapped);
                 if mapped.keys().len() < 2 {
                     None
                 } else {
@@ -293,8 +317,13 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let mut renaming_visitor = StructRenamer { names: mapped };
 
-    renaming_visitor.visit_file_mut(&mut http_routes_syntaxt);
-    renaming_visitor.visit_file_mut(&mut grpc_routes_syntaxt);
+    let unparsed_files: Vec<(String, String)> = visitors
+        .into_iter()
+        .map(|(name, mut f)| {
+            renaming_visitor.visit_file_mut(&mut f);
+            (name, prettyplease::unparse(&f))
+        })
+        .collect();
 
     let out = prettyplease::unparse(&File {
         shebang: None,
@@ -302,23 +331,17 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         items,
     });
 
-    let http_changed_out = prettyplease::unparse(&http_routes_syntaxt);
-    let grpc_changed_out = prettyplease::unparse(&grpc_routes_syntaxt);
-
-    let output_path = std::path::Path::new(&output_dir);
+    let output_path = std::path::Path::new(&out_dir);
 
     if output_path.is_dir() && output_path.exists() {
-        let mut http_out_file =
-            std::fs::File::create(output_path.join(http_routes_path.file_name().unwrap()))?;
-        let mut grpc_out_file =
-            std::fs::File::create(output_path.join(grpc_routes_path.file_name().unwrap()))?;
+        for (name, content) in unparsed_files {
+            let mut out_file = std::fs::File::create(output_path.join(name))?;
+            out_file
+                .write_all((SHARED_TYPES_USE_PREAMBLE.to_owned() + &content).as_bytes())
+                .unwrap();
+        }
 
         let mut shared_out_file = std::fs::File::create(output_path.join("shared_types.rs"))?;
-        http_out_file
-            .write_all((SHARED_TYPES_USE_PREAMBLE.to_owned() + &http_changed_out).as_bytes())
-            .unwrap();
-        grpc_out_file
-            .write_all((SHARED_TYPES_USE_PREAMBLE.to_owned() + &grpc_changed_out).as_bytes())?;
         let out = SHARED_TYPES_FILE_PREAMBLE.to_owned() + "\n\n\n" + &out;
         shared_out_file.write_all(out.as_bytes())?;
         Ok(())
