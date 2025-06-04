@@ -1,7 +1,9 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::fs;
+use std::fs::OpenOptions;
 use std::io;
+use std::io::Seek;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
@@ -37,9 +39,11 @@ use self::prelude::*;";
 const COMMON_TYPES_USE_PREAMBLE: &str = "use super::common_types::*;\n\n";
 const GENERATED_PREAMBLE: &str = "// WARNING! generated file do not edit\n\n";
 
-struct StructVisitor<'ast> {
+struct StructVisitor<'ast, 'b> {
     name: String,
     structs: Vec<&'ast ItemStruct>,
+    derived_type_prefix: &'b str,
+    derived_type_names: &'b BTreeSet<String>,
 }
 
 struct StructRenamer {
@@ -73,11 +77,18 @@ fn rewrite_ident(path: &mut PathSegment, names: &BTreeMap<String, String>) -> bo
     file_changed
 }
 
-fn check_simple_type(path: &PathSegment, is_simple: &mut bool) {
+fn check_simple_type(
+    path: &PathSegment,
+    is_simple: &mut bool,
+    derived_type_name_prefix: &str,
+    derived_type_names: &BTreeSet<String>,
+) {
     if path.arguments.is_empty() {
         let ident = &path.ident;
         if ident == &Ident::new("String", Span::call_site())
             || ident == &Ident::new("i32", Span::call_site())
+            || ident.to_string().starts_with(derived_type_name_prefix)
+            || derived_type_names.contains(&ident.to_string())
         {
         } else {
             *is_simple = false;
@@ -90,7 +101,12 @@ fn check_simple_type(path: &PathSegment, is_simple: &mut bool) {
                     match a {
                         syn::GenericArgument::Type(Type::Path(path)) => {
                             for s in &path.path.segments {
-                                check_simple_type(s, is_simple);
+                                check_simple_type(
+                                    s,
+                                    is_simple,
+                                    derived_type_name_prefix,
+                                    derived_type_names,
+                                );
                             }
                         }
                         _ => *is_simple = false,
@@ -102,7 +118,7 @@ fn check_simple_type(path: &PathSegment, is_simple: &mut bool) {
     }
 }
 
-impl<'ast> Visit<'ast> for StructVisitor<'ast> {
+impl<'ast, 'b> Visit<'ast> for StructVisitor<'ast, 'b> {
     fn visit_item_struct(&mut self, node: &'ast ItemStruct) {
         debug!("Visiting Struct name == {}", node.ident);
         //debug!("Visiting Struct name == {:#?}", node);
@@ -115,7 +131,12 @@ impl<'ast> Visit<'ast> for StructVisitor<'ast> {
                 );
 
                 for segment in &path_type.path.segments {
-                    check_simple_type(segment, &mut is_simple_leaf);
+                    check_simple_type(
+                        segment,
+                        &mut is_simple_leaf,
+                        self.derived_type_prefix,
+                        self.derived_type_names,
+                    );
                 }
             }
 
@@ -215,6 +236,7 @@ pub fn common_words(words_sets: &[Vec<String>]) -> Vec<String> {
 
 fn create_type_name_substitute(
     customized_names_from_file: &BTreeMap<String, String>,
+    derived_type_name_prefix: &str,
     v: &[(Ident, ItemStruct)],
 ) -> String {
     let words: Vec<Vec<String>> = v
@@ -223,7 +245,10 @@ fn create_type_name_substitute(
         .collect();
 
     let common_words = common_words(&words);
-    let type_new_name = format!("Common{}", common_words.iter().cloned().collect::<String>());
+    let type_new_name = format!(
+        "{derived_type_name_prefix}{}",
+        common_words.iter().cloned().collect::<String>()
+    );
 
     if let Some(customized_name) = customized_names_from_file.get(&type_new_name) {
         customized_name.clone()
@@ -232,7 +257,7 @@ fn create_type_name_substitute(
     }
 }
 
-fn read_type_names_from_file(
+fn read_type_mappings_from_file(
     mapped_names: &Path,
 ) -> Result<BTreeMap<String, String>, Box<dyn std::error::Error + Send + Sync>> {
     let mut mapped_types = BTreeMap::new();
@@ -247,6 +272,16 @@ fn read_type_names_from_file(
         }
     }
     Ok(mapped_types)
+}
+
+fn read_type_names_from_file(
+    mapped_names: &Path,
+) -> Result<BTreeSet<String>, Box<dyn std::error::Error + Send + Sync>> {
+    let mapped_names_file = std::fs::File::open(mapped_names)?;
+    Ok(io::BufReader::new(mapped_names_file)
+        .lines()
+        .map_while(Result::ok)
+        .collect::<BTreeSet<String>>())
 }
 
 fn write_type_names_to_file(
@@ -307,7 +342,18 @@ struct Args {
     out_dir: String,
 
     #[arg(long)]
+    current_pass_substitute_names: Option<PathBuf>,
+
+    #[arg(long)]
+    previous_pass_derived_type_names: Option<PathBuf>,
+
+    #[arg(long)]
     with_substitute_names: Option<PathBuf>,
+
+    #[arg(long)]
+    current_pass_derived_type_prefix: Option<String>,
+    #[arg(long)]
+    previous_pass_derived_type_prefix: Option<String>,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -316,17 +362,32 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         apis_dir,
         out_dir,
         with_substitute_names,
+        current_pass_substitute_names,
+        previous_pass_derived_type_names,
+        current_pass_derived_type_prefix,
+        previous_pass_derived_type_prefix,
     } = Args::parse();
+
+    let previous_pass_derived_type_prefix = previous_pass_derived_type_prefix.unwrap_or_default();
+    let current_pass_derived_type_prefix = current_pass_derived_type_prefix.unwrap_or_default();
 
     let Ok(_) = fs::exists(out_dir.clone()) else {
         return Err("our dir doesn't exist".into());
     };
 
-    let type_names_substitutes = if let Some(mapped_names) = with_substitute_names.as_ref() {
-        read_type_names_from_file(mapped_names.as_path())?
-    } else {
-        BTreeMap::new()
-    };
+    let current_pass_type_name_substitutes =
+        if let Some(mapped_names) = current_pass_substitute_names.as_ref() {
+            read_type_mappings_from_file(mapped_names.as_path())?
+        } else {
+            BTreeMap::new()
+        };
+
+    let previous_pass_derived_type_names =
+        if let Some(mapped_names) = previous_pass_derived_type_names.as_ref() {
+            read_type_names_from_file(mapped_names.as_path())?
+        } else {
+            BTreeSet::new()
+        };
 
     let mut visitors = vec![];
 
@@ -343,6 +404,8 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         let visitor = StructVisitor {
                             name,
                             structs: Vec::new(),
+                            derived_type_prefix: &previous_pass_derived_type_prefix,
+                            derived_type_names: &previous_pass_derived_type_names,
                         };
                         visitors.push((visitor, syntaxt_file));
                     }
@@ -374,7 +437,11 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             );
             let mapped_type_names = v.iter().map(|v| v.0.to_string()).collect::<Vec<_>>();
 
-            let type_new_name = create_type_name_substitute(&type_names_substitutes, v);
+            let type_new_name = create_type_name_substitute(
+                &current_pass_type_name_substitutes,
+                &current_pass_derived_type_prefix,
+                v,
+            );
 
             if let Some((_i, s)) = v.first() {
                 let mut new_struct = s.clone();
@@ -436,30 +503,6 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             renaming_visitor.visit_file_mut(&mut f);
             let new_file =
                 delete_replaced_structs(f, renaming_visitor.names.keys().cloned().collect());
-            // let File {
-            //     shebang,
-            //     attrs,
-            //     items,
-            // } = f;
-
-            // let items = items
-            //     .into_iter()
-            //     .filter(|item| match item {
-            //         // delete top level items with ident that was replaced
-            //         Item::Struct(item) => !renaming_visitor
-            //             .names
-            //             .keys()
-            //             .contains(&item.ident.to_string()),
-            //         _ => true,
-            //     })
-            //     .collect();
-
-            // let new_file = File {
-            //     shebang,
-            //     attrs,
-            //     items,
-            // };
-
             (
                 name,
                 prettyplease::unparse(&new_file),
@@ -468,22 +511,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         })
         .collect();
 
-    // let items = items
-    //     .into_iter()
-    //     .filter(|item| match item {
-    //         Item::Struct(item) => {
-    //             let t = renaming_visitor
-    //                 .names
-    //                 .keys()
-    //                 .contains(&item.ident.to_string());
-    //             warn!("Filtering out item {} {t}", item.ident);
-    //             t
-    //         }
-    //         _ => true,
-    //     })
-    //     .collect();
-
-    let out = prettyplease::unparse(&File {
+    let common_types = prettyplease::unparse(&File {
         shebang: None,
         attrs: vec![],
         items,
@@ -495,7 +523,9 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         info!("Writing changed file mod.rs");
         let mut mod_file = std::fs::File::create(output_path.join("mod.rs"))?;
         mod_file.write_all(GENERATED_PREAMBLE.as_bytes())?;
-        mod_file.write_all("pub mod common_types;\n\n".as_bytes())?;
+
+        let mut mod_names = vec!["pub mod common_types;\n".to_owned()];
+        //mod_file.write_all("pub mod common_types;\n\n".as_bytes())?;
 
         for (name, content, changed) in unparsed_files {
             if changed {
@@ -503,14 +533,41 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 let mut out_file = std::fs::File::create(output_path.join(name.clone()))?;
                 out_file.write_all(GENERATED_PREAMBLE.as_bytes())?;
                 out_file.write_all((COMMON_TYPES_USE_PREAMBLE.to_owned() + &content).as_bytes())?;
+            } else {
+                info!("Writing NOT changed file {name}");
+                let mut out_file = std::fs::File::create(output_path.join(name.clone()))?;
+                out_file.write_all(GENERATED_PREAMBLE.as_bytes())?;
+                out_file.write_all(content.as_bytes())?;
             }
 
-            mod_file.write_all(format!("pub mod {};\n", &name[..name.len() - 3]).as_bytes())?;
+            mod_names.push(format!("pub mod {};\n", &name[..name.len() - 3]));
         }
 
-        let mut common_out_file = std::fs::File::create(output_path.join("common_types.rs"))?;
-        let out = COMMON_TYPES_FILE_PREAMBLE.to_owned() + "\n\n\n" + &out;
-        common_out_file.write_all(out.as_bytes())?;
+        for mod_name in mod_names.into_iter().sorted().dedup() {
+            mod_file.write_all(mod_name.as_bytes())?;
+        }
+
+        let common_types_file_name = output_path.join("common_types.rs");
+
+        if common_types_file_name.exists() {
+            let mut common_out_file = OpenOptions::new()
+                .append(true)
+                .open(common_types_file_name)?;
+            //let mut common_out_file = std::fs::File::open(common_types_file_name)?;
+
+            debug!("Current position  {}", common_out_file.stream_position()?);
+
+            // common_out_file.seek(io::SeekFrom::End(0))?;
+            // debug!("Current position  {}", common_out_file.stream_position()?);
+            common_out_file.write_all("\n\n// Next attempt \n\n".as_bytes())?;
+            common_out_file.write_all(common_types.as_bytes())?;
+        } else {
+            let mut common_out_file = std::fs::File::create(common_types_file_name)?;
+            let common_types_file_content =
+                COMMON_TYPES_FILE_PREAMBLE.to_owned() + "\n\n\n" + &common_types;
+            common_out_file.write_all(common_types_file_content.as_bytes())?;
+        }
+
         Ok(())
     } else {
         Err("Make sure that output path is a folder and tha it exists".into())
